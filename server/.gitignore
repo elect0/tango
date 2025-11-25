@@ -1,0 +1,13 @@
+# Binaries
+main
+*.exe
+*.test
+
+# Keys (NEVER commit these!)
+keys
+keys.pub
+id_rsa
+id_rsa.pub
+
+# OS specific
+.DS_Store
