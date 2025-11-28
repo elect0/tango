@@ -8,9 +8,14 @@ func broadcastJoin(uid int) {
 	for id, ch := range clients {
 		var msg string
 		if id == uid {
-			msg = fmt.Sprintf("Restoring your terminal to its boring default state... Success.")
+			/* msg = fmt.Sprintf("Restoring your terminal to its boring default state... Success.") */
+			msg = fmt.Sprintf(`
+Welcome, [%s].
+Try not to break anything.
+Type /help if you are confused (which you look like you are).
+				`, getUserName(uid))
 		} else {
-			msg = announceDisconnect(getUserName(uid))
+			msg = announceConnect(getUserName(uid))
 		}
 		ch.Write([]byte(msg))
 	}

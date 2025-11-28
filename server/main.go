@@ -5,29 +5,22 @@ import (
 	"log"
 	"net"
 	"os"
-	"strings"
+	"strconv"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
-	terminal "golang.org/x/term"
+	// terminal "golang.org/x/term"
 )
 
-var (
-	clients   = make(map[ssh.Channel]struct{})
-	clientsMu sync.Mutex
-)
-
-func broadcast(msg, user string, currentClient ssh.Channel) {
-	clientsMu.Lock()
-	defer clientsMu.Unlock()
-	for client := range clients {
-		if currentClient != client {
-			_, _ = client.Write([]byte(user + " | " + msg + "\r\n"))
-		}
-	}
-}
+//
+// var (
+// 	clients   = make(map[ssh.Channel]struct{})
+// 	clientsMu sync.Mutex
+// )
 
 func main() {
+
+	loadUsers()
 
 	authorizedKeysBytes, err := os.ReadFile("keys.pub")
 	if err != nil {
@@ -54,14 +47,40 @@ func main() {
 			return nil, fmt.Errorf("password rejected for: %q", c.User())
 		},
 		PublicKeyCallback: func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
-			if authorizedKeys[string(pubKey.Marshal())] {
-				return &ssh.Permissions{
-					Extensions: map[string]string{
-						"pubkey-fp": ssh.FingerprintSHA256(pubKey),
-					},
-				}, nil
+			pub := string(ssh.MarshalAuthorizedKey(pubKey))
+
+			userMu.Lock()
+			var user *User
+			for _, u := range userStore.Users {
+				if u.Key == pub {
+					user = &u
+					break
+				}
 			}
-			return nil, fmt.Errorf("Unknown public key for: %q", c.User())
+			if user == nil {
+				user = &User{
+					ID:  generateUID(),
+					Username: c.User(),
+					Key: pub,
+				}
+				userStore.Users = append(userStore.Users, *user)
+				saveUsers()
+			}
+			userMu.Unlock()
+
+			// if authorizedKeys[string(pubKey.Marshal())] {
+			// 	return &ssh.Permissions{
+			// 		Extensions: map[string]string{
+			// 			"pubkey-fp": ssh.FingerprintSHA256(pubKey),
+			// 		},
+			// 	}, nil
+			// }
+			return &ssh.Permissions{
+				Extensions: map[string]string{
+					"id":       strconv.Itoa(user.ID),
+					"username": user.Username,
+				},
+			}, nil
 		},
 	}
 
@@ -86,84 +105,130 @@ func main() {
 		nConn, err := listener.Accept()
 		if err != nil {
 			log.Fatal("failed to accept incoming connection: ", err)
+			continue
 		}
 
+		conn, chans, reqs, err := ssh.NewServerConn(nConn, config)
+		if err != nil {
+			fmt.Println("SSH Handshake failure: %v", err)
+			continue
+		}
+
+		userId, _ := strconv.Atoi(conn.Permissions.Extensions["id"])
+		client := getUser(userId)
+		if client == nil {
+			fmt.Printf("User not found.")
+		}
+
+		var wg sync.WaitGroup
+
+		wg.Add(1)
+		wg.Go(func() {
+			ssh.DiscardRequests(reqs)
+			wg.Done()
+		})
+
 		go func() {
-			conn, chans, reqs, err := ssh.NewServerConn(nConn, config)
-
-
-			if err != nil {
-				log.Fatal("failed to handshake: ", err)
-			}
-
-			//	log.Printf("logged in with key %s", conn.Permissions.Extensions["pubkey-fp"])
-
-			var wg sync.WaitGroup
-
-			
-
-			wg.Add(1)
-			// go func() {
-			// 	ssh.DiscardRequests(reqs)
-			// 	wg.Done()
-			// }()
-			//
-			wg.Go(func() {
-				ssh.DiscardRequests(reqs)
-				wg.Done()
-			})
-
 			for newChannel := range chans {
 				if newChannel.ChannelType() != "session" {
 					newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
 					continue
 				}
-				channel, requests, err := newChannel.Accept()
 
 				clientsMu.Lock()
-				clients[channel] = struct{}{}
+				if _, exists := clients[userId]; exists {
+					msg := fmt.Sprintf("Login Failed: We already have a [%s], and one is plenty.", getUserName(userId))
+					newChannel.Reject(ssh.Prohibited, msg)
+					continue
+				}
 				clientsMu.Unlock()
 
-				if err != nil {
-					log.Fatalf("Could not accept channel: %v", err)
-				}
+				channel, _, _ := newChannel.Accept()
+				clientsMu.Lock()
+				clients[userId] = channel
+				clientsMu.Unlock()
 
-				wg.Add(1)
-				go func(in <-chan *ssh.Request) {
-					for req := range in {
-						switch req.Type {
-						case "shell", "pty-req":
-							req.Reply(true, nil)
-						default:
-							req.Reply(false, nil)
-						}
-					}
-					wg.Done()
-				}(requests)
-
-				term := terminal.NewTerminal(channel, "> ")
-
-				wg.Add(1)
-				go func() {
-					defer func() {
-						channel.Close()
-						clientsMu.Lock()
-						delete(clients, channel)
-						clientsMu.Unlock()
-						wg.Done()
-					}()
-					for {
-						line, err := term.ReadLine()
-						if err != nil {
-							break
-						}
-						broadcast(strings.TrimSpace(line), conn.User(),channel)
-					}
-				}()
+				go handleClient(channel, userId)
 			}
-			wg.Wait()
-			conn.Close()
-			log.Printf("connection closed")
 		}()
+
+		//
+		// 	conn, chans, reqs, err := ssh.NewServerConn(nConn, config)
+		//
+		// 	if err != nil {
+		// 		log.Fatal("failed to handshake: ", err)
+		// 	}
+		//
+		// 	//	log.Printf("logged in with key %s", conn.Permissions.Extensions["pubkey-fp"])
+		//
+		// 	var wg sync.WaitGroup
+		//
+		// 	wg.Add(1)
+		// 	wg.Go(func() {
+		// 		ssh.DiscardRequests(reqs)
+		// 		wg.Done()
+		// 	})
+		//
+		// 	for newChannel := range chans {
+		// 		if newChannel.ChannelType() != "session" {
+		// 			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
+		// 			continue
+		// 		}
+		// 		channel, requests, err := newChannel.Accept()
+		//
+		// 		clientsMu.Lock()
+		// 		if _, exists := clients[uid]; exists {
+		// 			msg := fmt.Sprintf("Login Failed: We already have a [%s], and one is plenty.", getUserName(uid))
+		// 			channel.Write([]byte(msg))
+		// 			channel.Close()
+		// 		}
+		//
+		// }
 	}
+
+	//
+	// 	clientsMu.Lock()
+	// 	clients[channel] = struct{}{}
+	// 	clientsMu.Unlock()
+	//
+	// 	if err != nil {
+	// 		log.Fatalf("Could not accept channel: %v", err)
+	// 	}
+	//
+	// 	wg.Add(1)
+	// 	go func(in <-chan *ssh.Request) {
+	// 		for req := range in {
+	// 			switch req.Type {
+	// 			case "shell", "pty-req":
+	// 				req.Reply(true, nil)
+	// 			default:
+	// 				req.Reply(false, nil)
+	// 			}
+	// 		}
+	// 		wg.Done()
+	// 	}(requests)
+	//
+	// 	term := terminal.NewTerminal(channel, "> ")
+	//
+	// 	wg.Add(1)
+	// 	go func() {
+	// 		defer func() {
+	// 			channel.Close()
+	// 			clientsMu.Lock()
+	// 			delete(clients, channel)
+	// 			clientsMu.Unlock()
+	// 			wg.Done()
+	// 		}()
+	// 		for {
+	// 			line, err := term.ReadLine()
+	// 			if err != nil {
+	// 				break
+	// 			}
+	// 			broadcast(strings.TrimSpace(line), conn.User(), channel)
+	// 		}
+	// 	}()
+	// }
+	// wg.Wait()
+	// conn.Close()
+	// log.Printf("connection closed")
 }
